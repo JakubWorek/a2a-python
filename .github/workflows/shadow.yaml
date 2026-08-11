@@ -18,9 +18,16 @@ on:
       a2a_itk_revision:
         description: 'a2a-itk revision (branch / tag / SHA) used by both legs'
         default: 'main'
+      a2a_itk_repo_url:
+        description: 'a2a-itk clone URL (fork carries unreleased fixes until upstream lands)'
+        default: 'https://github.com/JakubWorek/a2a-itk.git'
 
 permissions:
   contents: read
+
+env:
+  # Passed through to run_itk.sh and used by pre-build + compare clones.
+  A2A_ITK_REPO_URL: ${{ inputs.a2a_itk_repo_url }}
 
 jobs:
   shadow:
@@ -58,8 +65,9 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Fetch a2a-itk for pre-build
-        run: git clone --branch "${{ inputs.a2a_itk_revision }}" \
-             https://github.com/a2aproject/a2a-itk.git /tmp/a2a-itk-prebuild
+        run: |
+          git clone --branch "${{ inputs.a2a_itk_revision }}" \
+            "$A2A_ITK_REPO_URL" /tmp/a2a-itk-prebuild
 
       - name: Pre-build itk_service with GHA layer cache
         uses: docker/build-push-action@v6
@@ -93,9 +101,14 @@ jobs:
           A2A_ITK_REVISION: ${{ inputs.a2a_itk_revision }}
           ITK_ENTRYPOINT: itk_service.py
           ITK_NIGHTLY_RUN: "true"
+          # DEBUG triggers the /app/logs bind-mount in run_itk.sh so
+          # per-agent stdout/stderr is preserved on the host — required
+          # for post-mortem debugging of readiness failures.
+          ITK_LOG_LEVEL: DEBUG
         run: |
           bash run_itk.sh || true
           mv raw_results.json "$GITHUB_WORKSPACE/old_raw_results.json"
+          mv logs "$GITHUB_WORKSPACE/old_agent_logs" 2>/dev/null || true
 
       - name: Run NEW path (launcher itk_service_v2.py)
         working-directory: itk
@@ -103,16 +116,18 @@ jobs:
           A2A_ITK_REVISION: ${{ inputs.a2a_itk_revision }}
           ITK_ENTRYPOINT: itk_service_v2.py
           ITK_NIGHTLY_RUN: "true"
+          ITK_LOG_LEVEL: DEBUG
         run: |
           bash run_itk.sh || true
           mv raw_results.json "$GITHUB_WORKSPACE/new_raw_results.json"
+          mv logs "$GITHUB_WORKSPACE/new_agent_logs" 2>/dev/null || true
 
       - name: Compare OLD vs NEW
         working-directory: itk
         run: |
           if [ ! -d a2a-itk ]; then
             git clone --branch "${{ inputs.a2a_itk_revision }}" \
-              https://github.com/a2aproject/a2a-itk.git a2a-itk
+              "$A2A_ITK_REPO_URL" a2a-itk
           fi
           python3 a2a-itk/scripts/compare_results.py \
             --sdk python --line v10 \
@@ -128,6 +143,16 @@ jobs:
           name: diff-run${{ matrix.run }}
           path: diff_run${{ matrix.run }}.json
 
+      - name: Upload agent logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-logs-run${{ matrix.run }}
+          path: |
+            old_agent_logs
+            new_agent_logs
+          if-no-files-found: ignore
+
   gate:
     name: Run-count gate (all runs clean?)
     needs: shadow
@@ -137,6 +162,10 @@ jobs:
       - name: Download all diff artifacts
         uses: actions/download-artifact@v4
         with:
+          # Filter to just diff-run* — the run also has multi-GB
+          # `*.dockerbuild` artifacts from docker/build-push-action's
+          # cache export, and pulling them all times out the download.
+          pattern: diff-run*
           path: diffs
 
       - name: Require every matrix run to be is_clean=true

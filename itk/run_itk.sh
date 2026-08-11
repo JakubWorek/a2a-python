@@ -27,7 +27,9 @@ trap cleanup EXIT
 : "${A2A_ITK_REVISION:?A2A_ITK_REVISION environment variable must be set}"
 
 if [ ! -d "a2a-itk" ]; then
-  git clone https://github.com/a2aproject/a2a-itk.git a2a-itk
+  # A2A_ITK_REPO_URL lets the shadow workflow point at a fork carrying
+  # unreleased fixes; defaults to upstream so nothing changes elsewhere.
+  git clone "${A2A_ITK_REPO_URL:-https://github.com/a2aproject/a2a-itk.git}" a2a-itk
 fi
 cd a2a-itk
 git fetch origin
@@ -89,6 +91,8 @@ docker run -d --name itk-service \
   $DOCKER_MOUNT_LOGS \
   -e ITK_LOG_LEVEL="$ITK_LOG_LEVEL" \
   -e ITK_ENTRYPOINT="${ITK_ENTRYPOINT:-itk_service.py}" \
+  -e ITK_READINESS_TIMEOUT="${ITK_READINESS_TIMEOUT:-180}" \
+  -e ITK_MAX_WORKERS="${ITK_MAX_WORKERS:-2}" \
   -p 8000:8000 \
   itk_service
 
