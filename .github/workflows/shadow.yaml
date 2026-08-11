@@ -1,0 +1,160 @@
+name: Shadow — OLD vs NEW
+
+# Verification-only workflow: runs the same scenarios file through both
+# the legacy itk_service.py and the launcher-based itk_service_v2.py,
+# then classifies the diff with a2a-itk/scripts/compare_results.py.
+#
+# Lives on this fork's `shadow` branch and is discarded after cutover.
+# The gate job passes only when EVERY matrix run's report is is_clean=true.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Scenarios tier (pr = scenarios.json, nightly = scenarios_full.json)'
+        type: choice
+        options: [pr, nightly]
+        default: nightly
+      a2a_itk_revision:
+        description: 'a2a-itk revision (branch / tag / SHA) used by both legs'
+        default: 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  shadow:
+    name: Shadow run ${{ matrix.run }} (${{ inputs.tier }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          # a2a-sdk uses uv-dynamic-versioning which derives the version
+          # from `git describe --tags`; a shallow clone with no tags
+          # makes `uv sync` fail during SUT startup.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      # ---------------- caching ----------------
+      # Two caches, both survive across shadow runs on fresh GHA runners:
+      #   1. Docker layer cache for the ~5 GB `itk_service` image, via
+      #      BuildKit's GHA cache backend. Cold `docker build` from
+      #      scratch is ~5-10 min; a warm restore rebuilds in ~30s.
+      #   2. Launcher checkout+build cache (see a2a-itk/cache.py). The
+      #      cache dir is bind-mounted into the container by run_itk.sh;
+      #      entries are keyed by resolved SHA + image digest so a peer
+      #      `main` advancing just adds a new entry and LRU keeps the
+      #      old one until eviction.
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fetch a2a-itk for pre-build
+        run: git clone --branch "${{ inputs.a2a_itk_revision }}" \
+             https://github.com/a2aproject/a2a-itk.git /tmp/a2a-itk-prebuild
+
+      - name: Pre-build itk_service with GHA layer cache
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/a2a-itk-prebuild
+          tags: itk_service:latest
+          load: true
+          cache-from: type=gha,scope=itk-service
+          cache-to: type=gha,scope=itk-service,mode=max
+
+      - name: Cache launcher checkout+build trees
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/a2a-itk-launcher
+          # Primary key unique per run so we always save a fresh snapshot;
+          # restore-keys fall back to the newest match.
+          key: itk-launcher-cache-${{ runner.os }}-${{ github.run_id }}-${{ matrix.run }}
+          restore-keys: |
+            itk-launcher-cache-${{ runner.os }}-
+
+      - name: Resolve scenarios file from tier input
+        run: |
+          case "${{ inputs.tier }}" in
+            pr)      echo 'ITK_SCENARIOS_FILE=scenarios.json'      >> "$GITHUB_ENV" ;;
+            nightly) echo 'ITK_SCENARIOS_FILE=scenarios_full.json' >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Run OLD path (legacy itk_service.py)
+        working-directory: itk
+        env:
+          A2A_ITK_REVISION: ${{ inputs.a2a_itk_revision }}
+          ITK_ENTRYPOINT: itk_service.py
+          ITK_NIGHTLY_RUN: "true"
+        run: |
+          bash run_itk.sh || true
+          mv raw_results.json "$GITHUB_WORKSPACE/old_raw_results.json"
+
+      - name: Run NEW path (launcher itk_service_v2.py)
+        working-directory: itk
+        env:
+          A2A_ITK_REVISION: ${{ inputs.a2a_itk_revision }}
+          ITK_ENTRYPOINT: itk_service_v2.py
+          ITK_NIGHTLY_RUN: "true"
+        run: |
+          bash run_itk.sh || true
+          mv raw_results.json "$GITHUB_WORKSPACE/new_raw_results.json"
+
+      - name: Compare OLD vs NEW
+        working-directory: itk
+        run: |
+          if [ ! -d a2a-itk ]; then
+            git clone --branch "${{ inputs.a2a_itk_revision }}" \
+              https://github.com/a2aproject/a2a-itk.git a2a-itk
+          fi
+          python3 a2a-itk/scripts/compare_results.py \
+            --sdk python --line v10 \
+            --scenarios "$ITK_SCENARIOS_FILE" \
+            --old "$GITHUB_WORKSPACE/old_raw_results.json" \
+            --new "$GITHUB_WORKSPACE/new_raw_results.json" \
+            --report-file "$GITHUB_WORKSPACE/diff_run${{ matrix.run }}.json"
+
+      - name: Upload diff artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-run${{ matrix.run }}
+          path: diff_run${{ matrix.run }}.json
+
+  gate:
+    name: Run-count gate (all runs clean?)
+    needs: shadow
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all diff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: diffs
+
+      - name: Require every matrix run to be is_clean=true
+        run: |
+          python3 - <<'PY'
+          import json, glob, sys
+          paths = sorted(glob.glob('diffs/**/diff_run*.json', recursive=True))
+          if not paths:
+              print('No diff artifacts found — every matrix run failed to produce a report.')
+              sys.exit(1)
+          reports = [(p, json.load(open(p))) for p in paths]
+          failed = [(p, r) for p, r in reports if not r.get('is_clean', False)]
+          for p, r in reports:
+              print(f'{p}: is_clean={r.get("is_clean")} '
+                    f'matches={len(r.get("matches", []))} '
+                    f'real_failures={len(r.get("real_failures", []))} '
+                    f'infra_failures={len(r.get("infra_failures", []))} '
+                    f'divergences={len(r.get("behavioral_divergences", []))}')
+          print(f'\n{len(reports)} runs total, {len(failed)} not clean')
+          sys.exit(1 if failed else 0)
+          PY
