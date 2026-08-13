@@ -23,7 +23,7 @@ jobs:
       - name: Clone a2a-itk
         uses: actions/checkout@v6
         with:
-          repository: a2aproject/a2a-itk
+          repository: JakubWorek/a2a-itk
           ref: main
           path: itk/a2a-itk
 
