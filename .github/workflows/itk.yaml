@@ -1,6 +1,9 @@
 name: ITK
 
 on:
+  # Fork-only: lets a run be re-triggered against an updated a2a-itk
+  # without pushing a throwaway commit here.
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
